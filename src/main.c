@@ -762,10 +762,13 @@ int main(int argc, char **argv) {
 #endif
 
 	} else if (opt.dd) {
-
+		// Like the dd option
+		// But will copy the blocks back to front in order to safely self-copy on top of the crypt layer
+		
 		char *buffer;
 		int block_size = fs_info.block_size;
 		unsigned long long blocks_total = fs_info.totalblock;
+		unsigned long long real_block_id = blocks_total - 1; // because we start from the last block now
 		int buffer_capacity = block_size < opt.buffer_size ? opt.buffer_size / block_size : 1;
 
 		buffer = (char*)malloc(buffer_capacity * block_size);
@@ -781,7 +784,7 @@ int main(int argc, char **argv) {
 		log_mesg(0, 0, 0, debug, "Total block %llu\n", blocks_total);
 
 		/// start clone partition to partition
-		log_mesg(1, 0, 0, debug, "start backup data device-to-device...\n");
+		log_mesg(1, 0, 0, debug, "start backup data reverse device-to-device...\n");
 		do {
 			/// scan bitmap
 			unsigned long long blocks_skip, blocks_read;
@@ -789,31 +792,34 @@ int main(int argc, char **argv) {
 
 			/// skip unused blocks
 			for (blocks_skip = 0;
-			     block_id + blocks_skip < blocks_total &&
-			     !pc_test_bit(block_id + blocks_skip, bitmap, fs_info.totalblock);
+			     real_block_id - blocks_skip < blocks_total &&
+			     !pc_test_bit(real_block_id - blocks_skip, bitmap, fs_info.totalblock);
 			     blocks_skip++);
 
-			if (block_id + blocks_skip == blocks_total)
+			if (real_block_id - blocks_skip >= blocks_total)
 				break;
 
-			if (blocks_skip)
+			if (blocks_skip) {
+				real_block_id -= blocks_skip;
 				block_id += blocks_skip;
+			}
 
-			/// read chunk from source
+			/// calculate how many contiguous can we read at once
 			for (blocks_read = 0;
-			     block_id + blocks_read < blocks_total && blocks_read < buffer_capacity &&
-			     pc_test_bit(block_id + blocks_read, bitmap, fs_info.totalblock);
-			     ++blocks_read);
+			     real_block_id - blocks_read < blocks_total && blocks_read < buffer_capacity &&
+			     pc_test_bit(real_block_id - blocks_read, bitmap, fs_info.totalblock);
+			     blocks_read++);
 
 			if (!blocks_read)
 				break;
 
-			offset = (off_t)(block_id * block_size);
+			offset = (off_t)((real_block_id + 1 - blocks_read) * block_size);
 			if (lseek(dfr, offset, SEEK_SET) == (off_t)-1)
 				log_mesg(0, 1, 1, debug, "source seek ERROR:%s\n", strerror(errno));
 			if (lseek(dfw, offset + opt.offset, SEEK_SET) == (off_t)-1)
 				log_mesg(0, 1, 1, debug, "target seek ERROR:%s\n", strerror(errno));
 
+			// actually perform the read
 			r_size = read_all(&dfr, buffer, blocks_read * block_size, &opt);
 			if (r_size != (int)(blocks_read * block_size)) {
 				if ((r_size == -1) && (errno == EIO)) {
@@ -831,15 +837,16 @@ int main(int argc, char **argv) {
 			w_size = write_all(&dfw, buffer, blocks_read * block_size, &opt);
 			if (w_size != (int)(blocks_read * block_size)) {
 				if (opt.skip_write_error)
-					log_mesg(0, 0, 1, debug, "skip write block %lli error:%s\n", block_id, strerror(errno));
+					log_mesg(0, 0, 1, debug, "skip write block %lli error:%s\n", real_block_id, strerror(errno));
 				else
-					log_mesg(0, 1, 1, debug, "write block %lli ERROR:%s\n", block_id, strerror(errno));
+					log_mesg(0, 1, 1, debug, "write block %lli ERROR:%s\n", real_block_id, strerror(errno));
 			}
 
 			/// count copied block
 			copied += blocks_read;
 
 			/// next block
+			real_block_id -= blocks_read;
 			block_id += blocks_read;
 
 			/// read or write error
